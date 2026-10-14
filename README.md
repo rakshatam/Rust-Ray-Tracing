@@ -1,6 +1,7 @@
 # Sponza-RT: Real-Time GPU Compute Ray Tracer in Rust
 
-![Sponza Real-Time GPU Ray Tracer Viewport](./SponzaRT.jpg)
+![Sponza Real-Time GPU Ray Tracer Viewport]<img width="1278" height="753" alt="SponzaRT" src="https://github.com/user-attachments/assets/1ccf2e1e-9a74-462a-88dc-00facc275600" />
+
 
 > **Real-time hardware-agnostic GPU compute ray tracer for the 262,266-triangle Khronos Sponza Atrium in pure Rust (`wgpu 22.1` + WGSL), running at ~43.3 FPS on an NVIDIA GeForce RTX 3050 Laptop GPU (DirectX 12 / Vulkan). Features a depth-bounded 12-bin Surface Area Heuristic (SAH) BVH, atomic parallel texture provisioning, ray-traced alpha-cutout foliage, ray-traced sun shadows, short-range RTAO with approximate single-bounce albedo bleed, and an edge-stopping cross-bilateral denoiser.**
 
