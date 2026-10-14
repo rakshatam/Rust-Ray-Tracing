@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -17,14 +17,25 @@ use winit::event_loop::{ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowBuilder};
 
+// Pinned to an immutable Khronos Group glTF-Sample-Assets commit SHA (723ffc6)
+const SPONZA_COMMIT_SHA: &str = "723ffc6";
 const SPONZA_BASE_URL: &str =
-    "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/Sponza/glTF";
+    "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/723ffc6/Models/Sponza/glTF";
 const SPONZA_GLTF_URL: &str =
-    "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/Sponza/glTF/Sponza.gltf";
+    "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/723ffc6/Models/Sponza/glTF/Sponza.gltf";
 const SPONZA_BIN_URL: &str =
-    "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/Sponza/glTF/Sponza.bin";
+    "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/723ffc6/Models/Sponza/glTF/Sponza.bin";
 const ASSET_DIR: &str = "assets/sponza/glTF";
+
+// Hard upper bound per HTTP asset read (32 MB) to prevent unbounded memory allocation
+const MAX_ASSET_BYTES: u64 = 32 * 1024 * 1024;
 const TEX_DIM: u32 = 512;
+
+// GPU traversal stack holds 32 entries; enforce max tree depth <= 31 so no subtree is ever dropped
+const GPU_MAX_STACK_DEPTH: u32 = 32;
+const MAX_BVH_DEPTH: u32 = GPU_MAX_STACK_DEPTH - 1;
+
+static TEMP_FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 // ============================================================================
 // GPU Data Structures (16-byte aligned for WGSL / SPIR-V / DXIL compatibility)
@@ -49,8 +60,8 @@ pub struct GpuTriangle {
     pub n0: [f32; 4],           // xyz: n0, w: uv1.y
     pub n1: [f32; 4],           // xyz: n1, w: uv2.x
     pub n2: [f32; 4],           // xyz: n2, w: uv2.y
-    pub albedo_rough: [f32; 4], // xyz: base_color_factor, w: roughness
-    pub emissive_mat: [f32; 4], // x: tex_layer_idx, y: alpha_cutoff, z: metallic, w: pad
+    pub albedo_rough: [f32; 4], // xyz: base_color_factor, w: roughness_factor
+    pub emissive_mat: [f32; 4], // x: tex_layer_idx, y: alpha_cutoff, z: metallic_factor, w: pad
 }
 
 #[repr(C)]
@@ -100,7 +111,7 @@ pub struct SceneAssets {
 }
 
 // ============================================================================
-// Phase 1: Pre-Flight System, Cargo & Toolchain Diagnostics
+// Phase 1: Startup Host Environment & CLI Configuration Banner
 // ============================================================================
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,42 +121,28 @@ enum BackendPreference {
     Vulkan,
 }
 
-fn preflight_system_scan() -> BackendPreference {
+fn print_startup_banner() -> BackendPreference {
     println!("========================================================================");
-    println!(" [PHASE 1] PRE-FLIGHT SYSTEM, CARGO & HARDWARE REQUIREMENTS SCAN");
+    println!(" [PHASE 1] HOST ENVIRONMENT & CLI CONFIGURATION BANNER");
     println!("========================================================================");
 
+    let pkg_name = env!("CARGO_PKG_NAME");
+    let pkg_ver = env!("CARGO_PKG_VERSION");
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
+
+    println!(" -> Binary Package   : {} v{}", pkg_name, pkg_ver);
     println!(
-        " -> Host Platform    : {} ({}) | Logical Cores: {}",
+        " -> Host Platform    : {} ({}) | Logical CPU Cores: {}",
         os, arch, threads
     );
-
-    if let Ok(out) = Command::new("cargo").arg("--version").output() {
-        if out.status.success() {
-            println!(
-                " -> Cargo Toolchain  : OK ({})",
-                String::from_utf8_lossy(&out.stdout).trim()
-            );
-        }
-    }
-
-    if let Ok(out) = Command::new("rustc").arg("--version").output() {
-        if out.status.success() {
-            println!(
-                " -> Rust Compiler    : OK ({})",
-                String::from_utf8_lossy(&out.stdout).trim()
-            );
-        }
-    }
-
-    if Path::new("Cargo.toml").exists() {
-        println!(" -> Cargo Manifest   : Verified local Cargo.toml");
-    }
+    println!(
+        " -> Asset Pin SHA    : KhronosGroup/glTF-Sample-Assets @ {}",
+        SPONZA_COMMIT_SHA
+    );
 
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--vulkan") {
@@ -155,15 +152,19 @@ fn preflight_system_scan() -> BackendPreference {
         println!(" -> CLI Override     : Forcing DirectX 12 Backend");
         BackendPreference::Dx12
     } else {
+        println!(" -> Backend Mode     : Auto-Select Optimal Discrete Adapter (DX12/Vulkan)");
         BackendPreference::Auto
     }
 }
 
 // ============================================================================
-// Phase 2: Sponza Atrium Auto-Installer, Parallel Texture Downloader & Importer
+// Phase 2: Atomic Sponza Asset Provisioner, Texture Downloader & glTF Importer
 // ============================================================================
 
-fn download_file(url: &str, dest: &Path, quiet: bool) -> Result<()> {
+/// Downloads `url` with a hard size limit (`MAX_ASSET_BYTES`), verifies `Content-Length`
+/// if provided by the server, writes to an isolated `.part` temporary file, flushes to disk,
+/// and atomically renames to `dest` so interrupted downloads never corrupt the cache.
+fn download_file_atomic(url: &str, dest: &Path, min_expected_bytes: usize, quiet: bool) -> Result<()> {
     if !quiet {
         println!(" -> Downloading      : {} -> {}", url, dest.display());
     }
@@ -172,19 +173,67 @@ fn download_file(url: &str, dest: &Path, quiet: bool) -> Result<()> {
         .call()
         .with_context(|| format!("HTTP GET failed for {}", url))?;
 
-    let mut reader = response.into_reader();
-    let mut bytes = Vec::new();
-    reader.read_to_end(&mut bytes)?;
+    let expected_len: Option<usize> = response
+        .header("Content-Length")
+        .and_then(|s| s.parse::<usize>().ok());
 
-    if bytes.len() < 128 {
-        anyhow::bail!("Downloaded payload too small ({} bytes)", bytes.len());
+    let mut bytes = Vec::with_capacity(expected_len.unwrap_or(64 * 1024).min(MAX_ASSET_BYTES as usize));
+    let mut bounded_reader = response.into_reader().take(MAX_ASSET_BYTES + 1);
+    bounded_reader.read_to_end(&mut bytes)?;
+
+    if (bytes.len() as u64) > MAX_ASSET_BYTES {
+        anyhow::bail!(
+            "Download from {} exceeded safety cap of {} bytes",
+            url,
+            MAX_ASSET_BYTES
+        );
+    }
+
+    if let Some(cl) = expected_len {
+        if bytes.len() != cl {
+            anyhow::bail!(
+                "Truncated HTTP stream for {}: received {} of {} bytes",
+                url,
+                bytes.len(),
+                cl
+            );
+        }
+    }
+
+    if bytes.len() < min_expected_bytes {
+        anyhow::bail!(
+            "Downloaded payload from {} too small ({} bytes < {} min)",
+            url,
+            bytes.len(),
+            min_expected_bytes
+        );
     }
 
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut file = fs::File::create(dest)?;
-    file.write_all(&bytes)?;
+
+    let seq = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = dest.with_extension(format!("part.{}.{}", std::process::id(), seq));
+
+    {
+        let mut tmp_file = fs::File::create(&tmp_path)
+            .with_context(|| format!("Failed to create temp file {}", tmp_path.display()))?;
+        tmp_file.write_all(&bytes)?;
+        tmp_file.sync_all()?;
+    }
+
+    if let Err(e) = fs::rename(&tmp_path, dest) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e).with_context(|| {
+            format!(
+                "Failed to atomically rename {} to {}",
+                tmp_path.display(),
+                dest.display()
+            )
+        });
+    }
+
     if !quiet {
         println!(
             " -> Installed        : {} ({:.2} MB)",
@@ -195,28 +244,43 @@ fn download_file(url: &str, dest: &Path, quiet: bool) -> Result<()> {
     Ok(())
 }
 
-fn ensure_sponza_assets() -> Option<PathBuf> {
+fn ensure_sponza_geometry_files(force_redownload: bool) -> Option<PathBuf> {
     println!("========================================================================");
-    println!(" [PHASE 2] SPONZA ATRIUM ASSET & PBR TEXTURE AUTO-INSTALLER");
+    println!(" [PHASE 2] SPONZA ATRIUM ASSET & TEXTURE ARRAY PROVISIONER");
     println!("========================================================================");
 
     let gltf_path = Path::new(ASSET_DIR).join("Sponza.gltf");
     let bin_path = Path::new(ASSET_DIR).join("Sponza.bin");
 
-    if !gltf_path.exists() {
-        if let Err(e) = download_file(SPONZA_GLTF_URL, &gltf_path, false) {
+    if force_redownload {
+        let _ = fs::remove_file(&gltf_path);
+        let _ = fs::remove_file(&bin_path);
+    }
+
+    let gltf_valid = gltf_path
+        .metadata()
+        .map(|m| m.len() >= 100_000)
+        .unwrap_or(false);
+    if !gltf_valid {
+        if let Err(e) = download_file_atomic(SPONZA_GLTF_URL, &gltf_path, 100_000, false) {
             println!(" [!] Network fetch warning (Sponza.gltf): {}", e);
             return None;
         }
     } else {
-        println!(" -> Sponza Geometry  : FOUND at {}", gltf_path.display());
+        println!(" -> Sponza Manifest  : FOUND at {}", gltf_path.display());
     }
 
-    if !bin_path.exists() {
-        if let Err(e) = download_file(SPONZA_BIN_URL, &bin_path, false) {
+    let bin_valid = bin_path
+        .metadata()
+        .map(|m| m.len() >= 9_000_000)
+        .unwrap_or(false);
+    if !bin_valid {
+        if let Err(e) = download_file_atomic(SPONZA_BIN_URL, &bin_path, 9_000_000, false) {
             println!(" [!] Network fetch warning (Sponza.bin): {}", e);
             return None;
         }
+    } else {
+        println!(" -> Sponza Geometry  : FOUND at {}", bin_path.display());
     }
 
     Some(gltf_path)
@@ -240,11 +304,22 @@ fn load_sponza_gltf_with_textures(gltf_path: &Path) -> Result<SceneAssets> {
     let bin_data = fs::read(&bin_path)
         .with_context(|| format!("Failed to read binary buffer {}", bin_path.display()))?;
 
+    // Verify binary buffer size against the byte_length declared inside Sponza.gltf
+    if let Some(first_buf) = gltf.buffers().next() {
+        if bin_data.len() < first_buf.length() {
+            anyhow::bail!(
+                "Cached Sponza.bin is truncated ({} bytes < {} bytes declared in glTF)",
+                bin_data.len(),
+                first_buf.length()
+            );
+        }
+    }
+
     // Collect all unique baseColorTexture image URIs referenced by Sponza materials
     let mut unique_uris: Vec<String> = Vec::new();
     let mut uri_to_layer: HashMap<String, usize> = HashMap::new();
 
-    // Layer 0 is always a pure white 512x512 fallback texture for untextured materials
+    // Layer 0 is a solid warm-white fallback texture for untextured primitives
     let mut texture_layers: Vec<Vec<u8>> = vec![make_solid_layer([235, 230, 220, 255])];
 
     for mat in gltf.materials() {
@@ -259,13 +334,17 @@ fn load_sponza_gltf_with_textures(gltf_path: &Path) -> Result<SceneAssets> {
         }
     }
 
-    // Download any missing Sponza baseColor textures in parallel (8 threads)
+    // Download any missing Sponza baseColor textures in parallel (8 threads) using atomic temp-file rename
     let missing_downloads: Vec<(usize, String, PathBuf)> = unique_uris
         .iter()
         .enumerate()
         .filter_map(|(i, uri)| {
             let local_path = Path::new(ASSET_DIR).join(uri);
-            if !local_path.exists() {
+            let exists_and_nonempty = local_path
+                .metadata()
+                .map(|m| m.len() >= 512)
+                .unwrap_or(false);
+            if !exists_and_nonempty {
                 Some((i + 1, uri.clone(), local_path))
             } else {
                 None
@@ -276,7 +355,7 @@ fn load_sponza_gltf_with_textures(gltf_path: &Path) -> Result<SceneAssets> {
     let total_textures = unique_uris.len();
     if !missing_downloads.is_empty() {
         println!(
-            " -> Provisioning     : Downloading {} Sponza PBR baseColor textures in parallel...",
+            " -> Provisioning     : Downloading {} Sponza baseColor textures in parallel...",
             missing_downloads.len()
         );
         let queue = Arc::new(Mutex::new(missing_downloads));
@@ -294,7 +373,7 @@ fn load_sponza_gltf_with_textures(gltf_path: &Path) -> Result<SceneAssets> {
                         break;
                     };
                     let url = format!("{}/{}", SPONZA_BASE_URL, uri);
-                    match download_file(&url, &dest, true) {
+                    match download_file_atomic(&url, &dest, 512, true) {
                         Ok(_) => println!(
                             "    [Texture {:02}/{}] Installed {}",
                             idx, total_textures, uri
@@ -309,12 +388,13 @@ fn load_sponza_gltf_with_textures(gltf_path: &Path) -> Result<SceneAssets> {
         });
     } else {
         println!(
-            " -> Sponza Textures  : All {} PBR baseColor textures verified in cache",
+            " -> Sponza Textures  : All {} baseColor textures verified in cache",
             total_textures
         );
     }
 
-    // Decode & resize all unique textures in parallel across CPU cores
+    // Decode & resize all unique textures in parallel across CPU cores.
+    // If a cached texture file is corrupted, delete it and re-fetch once atomically.
     println!(
         " -> Decoding Textures: Building {}x{} RGBA8 sRGB GPU Texture2DArray ({} layers)...",
         TEX_DIM,
@@ -344,7 +424,15 @@ fn load_sponza_gltf_with_textures(gltf_path: &Path) -> Result<SceneAssets> {
                     break;
                 };
                 let path = Path::new(ASSET_DIR).join(&uri);
-                let layer_bytes = match image::open(&path) {
+                let decoded = image::open(&path).or_else(|_| {
+                    // Self-heal corrupted cached texture file by purging and re-downloading
+                    let _ = fs::remove_file(&path);
+                    let url = format!("{}/{}", SPONZA_BASE_URL, uri);
+                    let _ = download_file_atomic(&url, &path, 512, true);
+                    image::open(&path)
+                });
+
+                let layer_bytes = match decoded {
                     Ok(img) => {
                         let resized = img.resize_exact(TEX_DIM, TEX_DIM, FilterType::Triangle);
                         resized.to_rgba8().into_raw()
@@ -502,16 +590,7 @@ fn traverse_gltf_node(
     }
 
     for child in node.children() {
-        traverse_gltf_node(child.Borrow(), world_xform, bin_data, uri_to_layer, out_tris);
-    }
-}
-
-trait BorrowNode {
-    fn Borrow(&self) -> &gltf::Node<'_>;
-}
-impl<'a> BorrowNode for gltf::Node<'a> {
-    fn Borrow(&self) -> &gltf::Node<'a> {
-        self
+        traverse_gltf_node(&child, world_xform, bin_data, uri_to_layer, out_tris);
     }
 }
 
@@ -574,7 +653,7 @@ fn generate_procedural_sponza_atrium() -> SceneAssets {
 }
 
 // ============================================================================
-// Phase 3: 12-Bin Surface Area Heuristic (SAH) BVH Compiler
+// Phase 3: 12-Bin Surface Area Heuristic (SAH) BVH Compiler with Depth Guard
 // ============================================================================
 
 struct BvhPrimitive {
@@ -615,14 +694,24 @@ impl BvhBuilder {
             .collect();
 
         let mut nodes = Vec::with_capacity(triangles.len() * 2);
-        Self::build_recursive(&mut prims, 0, triangles.len(), &mut nodes);
+        let mut max_depth: u32 = 0;
+        Self::build_recursive(&mut prims, 0, 0, &mut max_depth, &mut nodes);
+
+        assert!(
+            max_depth <= GPU_MAX_STACK_DEPTH,
+            "BVH max depth ({}) exceeded GPU traversal stack capacity ({})",
+            max_depth,
+            GPU_MAX_STACK_DEPTH
+        );
 
         let reordered_tris: Vec<GpuTriangle> =
             prims.iter().map(|p| triangles[p.orig_idx]).collect();
 
         println!(
-            " -> SAH BVH Compiled : {} nodes for {} triangles in {:.2?}",
+            " -> SAH BVH Compiled : {} nodes (Max Depth: {}/{}) for {} triangles in {:.2?}",
             nodes.len(),
+            max_depth,
+            GPU_MAX_STACK_DEPTH,
             reordered_tris.len(),
             start.elapsed()
         );
@@ -632,9 +721,12 @@ impl BvhBuilder {
     fn build_recursive(
         prims: &mut [BvhPrimitive],
         first_global: usize,
-        total_count: usize,
+        depth: u32,
+        max_depth: &mut u32,
         nodes: &mut Vec<GpuBvhNode>,
     ) -> u32 {
+        *max_depth = (*max_depth).max(depth);
+
         let node_idx = nodes.len() as u32;
         nodes.push(GpuBvhNode {
             aabb_min: [0.0; 3],
@@ -651,7 +743,8 @@ impl BvhBuilder {
         }
 
         let count = prims.len();
-        if count <= 4 {
+        // Force a leaf node if count <= 4 OR if depth reaches MAX_BVH_DEPTH (guarantees stack never overflows)
+        if count <= 4 || depth >= MAX_BVH_DEPTH {
             nodes[node_idx as usize] = GpuBvhNode {
                 aabb_min: bounds.min.to_array(),
                 left_or_first: first_global as u32,
@@ -758,9 +851,10 @@ impl BvhBuilder {
         };
 
         let (left_slice, right_slice) = prims.split_at_mut(mid);
-        let _left_child = Self::build_recursive(left_slice, first_global, total_count, nodes);
+        let _left_child =
+            Self::build_recursive(left_slice, first_global, depth + 1, max_depth, nodes);
         let right_child =
-            Self::build_recursive(right_slice, first_global + mid, total_count, nodes);
+            Self::build_recursive(right_slice, first_global + mid, depth + 1, max_depth, nodes);
 
         nodes[node_idx as usize] = GpuBvhNode {
             aabb_min: bounds.min.to_array(),
@@ -1059,7 +1153,7 @@ impl RayTracerEngine {
         };
         surface.configure(&device, &config);
 
-        // Upload all Sponza PBR baseColor textures into a GPU Texture2DArray (Rgba8UnormSrgb)
+        // Upload Sponza baseColor textures into a GPU Texture2DArray (Rgba8UnormSrgb)
         let num_layers = (texture_layers.len() as u32).max(1);
         let mat_tex_array = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Sponza Material Texture2DArray"),
@@ -1472,7 +1566,7 @@ impl RayTracerEngine {
 
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("BVH PathTracing Compute Pass"),
+                label: Some("BVH RayTracing Compute Pass"),
                 timestamp_writes: None,
             });
             cpass.set_pipeline(&self.compute_pipeline);
@@ -1484,7 +1578,7 @@ impl RayTracerEngine {
 
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Fullscreen ToneMap Blit Pass"),
+                label: Some("Fullscreen ToneMap & Bilateral Blit Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &surface_view,
                     resolve_target: None,
@@ -1525,11 +1619,16 @@ fn set_cursor_grab(window: &Window, locked: bool) {
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
-    let backend_pref = preflight_system_scan();
+    let backend_pref = print_startup_banner();
 
-    let scene_assets = match ensure_sponza_assets()
+    // Load Sponza glTF + textures; if cached files fail integrity checks, purge & re-fetch once
+    let scene_assets = match ensure_sponza_geometry_files(false)
         .and_then(|p| load_sponza_gltf_with_textures(&p).ok())
-    {
+        .or_else(|| {
+            println!(" [!] Cached Sponza asset validation failed; attempting clean re-download...");
+            ensure_sponza_geometry_files(true)
+                .and_then(|p| load_sponza_gltf_with_textures(&p).ok())
+        }) {
         Some(assets) => assets,
         None => generate_procedural_sponza_atrium(),
     };

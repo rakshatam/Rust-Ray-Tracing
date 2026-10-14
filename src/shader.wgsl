@@ -1,5 +1,9 @@
 // ============================================================================
-// Sponza Real-Time GPU Ray Tracer with Texture2DArray & Alpha-Cutout BVH
+// Sponza Real-Time GPU Compute Ray Tracer & Bilateral Denoiser (WGSL)
+// - Ordered DFS BVH traversal with ray-traced alpha-cutout masks
+// - Ray-traced sun shadows, short-range RTAO & approximate single-bounce bleed
+// - Base-color Texture2DArray (sRGB) + Blinn-Phong specular
+// - Interleaved Gradient Noise (IGN) & 3x3 cross-bilateral spatial filter
 // ============================================================================
 
 struct CameraUniform {
@@ -17,8 +21,8 @@ struct GpuTriangle {
     n0: vec4<f32>,               // xyz: normal 0, w: uv1.y
     n1: vec4<f32>,               // xyz: normal 1, w: uv2.x
     n2: vec4<f32>,               // xyz: normal 2, w: uv2.y
-    albedo_rough: vec4<f32>,     // xyz: base_color_factor, w: roughness
-    emissive_mat: vec4<f32>,     // x: tex_layer_idx, y: alpha_cutoff, z: metallic, w: pad
+    albedo_rough: vec4<f32>,     // xyz: base_color_factor, w: roughness_factor
+    emissive_mat: vec4<f32>,     // x: tex_layer_idx, y: alpha_cutoff, z: metallic_factor, w: pad
 };
 
 struct GpuBvhNode {
@@ -62,11 +66,13 @@ fn pcg_hash(input: u32) -> u32 {
     return (word >> 22u) ^ word;
 }
 
+// Uniform float in [0.0, 1.0) using exact 24-bit IEEE-754 mantissa precision
 fn rand_f32(seed: ptr<function, u32>) -> f32 {
     *seed = pcg_hash(*seed);
-    return f32(*seed) / 4294967295.0;
+    return f32(*seed >> 8u) * (1.0 / 16777216.0);
 }
 
+// Interleaved Gradient Noise (Jimenez 2014) for screen-space hemisphere stratification
 fn ign_noise(px: u32, py: u32, frame: u32) -> f32 {
     let fpx = f32(px) + 5.588238 * f32(frame & 63u);
     let fpy = f32(py) + 5.588238 * f32(frame & 63u);
@@ -81,7 +87,7 @@ fn interpolate_uv(tri: GpuTriangle, u: f32, v: f32) -> vec2<f32> {
     return uv0 * w + uv1 * u + uv2 * v;
 }
 
-// 4-tap bilinear texture fetch from the GPU Texture2DArray (works in any control flow in DX12/Vulkan)
+// 4-tap bilinear fetch from the GPU Texture2DArray (safe in divergent compute control flow)
 fn sample_material_tex(uv: vec2<f32>, layer: i32) -> vec4<f32> {
     let u_wrap = uv.x - floor(uv.x);
     let v_wrap = uv.y - floor(uv.y);
@@ -107,7 +113,7 @@ fn sample_material_tex(uv: vec2<f32>, layer: i32) -> vec4<f32> {
     return mix(top, bot, wy);
 }
 
-// Fast single-tap alpha check for cutout leaves, flowers, thorns, and chains inside BVH traversal
+// Alpha-cutout test for masked foliage, flowers, thorns, and chains inside BVH traversal
 fn passes_alpha_cutout(tri: GpuTriangle, u: f32, v: f32) -> bool {
     let cutoff = tri.emissive_mat.y;
     if (cutoff <= 0.0) {
@@ -420,7 +426,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let roughness = clamp(tri.albedo_rough.w, 0.08, 0.98);
         let metallic = clamp(tri.emissive_mat.z, 0.0, 1.0);
 
-        // 1. Direct Sun Lighting with Ray-Traced Shadows (including cutout leaf shadows)
+        // 1. Direct Sun Lighting with Ray-Traced Shadows & Blinn-Phong Specular
         var test_sun = sun_dir;
         if (frame_idx > 2u) {
             let disk_r = 0.015 * sqrt(rand_f32(&seed));
@@ -445,17 +451,17 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         }
 
-        // 2. Ray-Traced Ambient Occlusion (RTAO) + Textured Indirect Color Bleed
+        // 2. Short-Range Ray-Traced Ambient Occlusion (RTAO) & Approximate Bounce Bleed
         let r1 = ign_noise(gid.x, gid.y, frame_idx);
         let r2 = fract(r1 + 0.6180339887 * f32((frame_idx & 31u) + 1u));
         let bounce_dir = sample_cosine_hemisphere(n, r1, r2);
 
-        var gi_ray: Ray;
-        gi_ray.origin = hit_pos;
-        gi_ray.dir = bounce_dir;
-        gi_ray.inv_dir = safe_inv_dir(gi_ray.dir);
+        var ao_ray: Ray;
+        ao_ray.origin = hit_pos;
+        ao_ray.dir = bounce_dir;
+        ao_ray.inv_dir = safe_inv_dir(ao_ray.dir);
 
-        let ao_hit = trace_bvh(gi_ray, 8.5);
+        let ao_hit = trace_bvh(ao_ray, 8.5);
         var ao_factor = 1.0;
         var bounce_bleed = vec3<f32>(0.0);
 
@@ -468,18 +474,18 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             bounce_bleed = vec3<f32>(0.32, 0.42, 0.58);
         }
 
-        // 3. Multi-Directional Atrium Global Illumination
+        // 3. Analytical Hemisphere Sky/Floor Fill + RTAO Modulation
         let sky_hemi = 0.5 + 0.5 * n.y;
         let floor_hemi = 0.5 - 0.5 * n.y;
         let sky_light = vec3<f32>(0.34, 0.44, 0.62) * sky_hemi;
         let floor_bounce = vec3<f32>(0.45, 0.36, 0.26) * floor_hemi;
         let corridor_fill = vec3<f32>(0.18, 0.16, 0.14) * abs(n.z);
 
-        let indirect_gi = (sky_light + floor_bounce + corridor_fill + bounce_bleed) * ao_factor;
-        radiance += albedo * indirect_gi;
+        let indirect_approx = (sky_light + floor_bounce + corridor_fill + bounce_bleed) * ao_factor;
+        radiance += albedo * indirect_approx;
     }
 
-    // Temporal accumulation
+    // Temporal accumulation with neighborhood-clamped motion blend on frame 0
     let prev = accum_buffer[pixel_idx].xyz;
     var accumulated = radiance;
     if (frame_idx == 0u) {
@@ -498,7 +504,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // ============================================================================
-// Fullscreen Edge-Preserving Bilateral Denoiser & Blit Pass
+// Fullscreen Edge-Preserving Cross-Bilateral Denoiser & Blit Pass
 // ============================================================================
 
 struct VsOut {

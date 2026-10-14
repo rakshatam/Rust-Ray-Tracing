@@ -1,8 +1,8 @@
-# Sponza-RT: Real-Time GPU Compute Ray Tracer & Path Tracer in Rust
+# Sponza-RT: Real-Time GPU Compute Ray Tracer in Rust
 
-![Sponza Real-Time GPU Ray Tracer Viewport](./SponzaRT.png)
+![Sponza Real-Time GPU Ray Tracer Viewport](./SponzaRT.jpg)
 
-> **Real-time hardware-agnostic GPU ray tracing of the 262,266-triangle Khronos Sponza Atrium in pure Rust (`wgpu` + WGSL compute shaders), featuring a 12-bin Surface Area Heuristic (SAH) BVH, parallel PBR texture array provisioning, ray-traced alpha-cutout foliage, and a depth-aware edge-stopping bilateral denoiser.**
+> **Real-time hardware-agnostic GPU compute ray tracer for the 262,266-triangle Khronos Sponza Atrium in pure Rust (`wgpu 22.1` + WGSL), running at ~43.3 FPS on an NVIDIA GeForce RTX 3050 Laptop GPU (DirectX 12 / Vulkan). Features a depth-bounded 12-bin Surface Area Heuristic (SAH) BVH, atomic parallel texture provisioning, ray-traced alpha-cutout foliage, ray-traced sun shadows, short-range RTAO with approximate single-bounce albedo bleed, and an edge-stopping cross-bilateral denoiser.**
 
 ---
 
@@ -11,28 +11,28 @@
 2. [System Architecture & 5-Phase Execution Pipeline](#2-system-architecture--5-phase-execution-pipeline)
 3. [Deep-Dive Systems & Graphics Engineering Breakdown](#3-deep-dive-systems--graphics-engineering-breakdown)
    - [3.1 GPU Memory Alignment & Cache-Line Packing (`#[repr(C)]`)](#31-gpu-memory-alignment--cache-line-packing-reprc)
-   - [3.2 12-Bin Surface Area Heuristic (SAH) BVH Compiler](#32-12-bin-surface-area-heuristic-sah-bvh-compiler)
+   - [3.2 Depth-Bounded 12-Bin Surface Area Heuristic (SAH) BVH Compiler](#32-depth-bounded-12-bin-surface-area-heuristic-sah-bvh-compiler)
    - [3.3 Pointerless DFS BVH Layout & Ordered Short-Stack Traversal](#33-pointerless-dfs-bvh-layout--ordered-short-stack-traversal)
    - [3.4 Möller–Trumbore Ray-Triangle Intersection](#34-möllertrumbore-ray-triangle-intersection)
-   - [3.5 Hardware Texture2DArray & Ray-Traced Alpha-Cutout Masks](#35-hardware-texture2darray--ray-traced-alpha-cutout-masks)
-   - [3.6 Lighting, Blue-Noise RTAO & Temporal Neighborhood Clamping](#36-lighting-blue-noise-rtao--temporal-neighborhood-clamping)
+   - [3.5 Base-Color `Texture2DArray` & Ray-Traced Alpha-Cutout Masks](#35-base-color-texture2darray--ray-traced-alpha-cutout-masks)
+   - [3.6 Hybrid Lighting: Ray-Traced Shadows, Short-Range RTAO & Approximate Bounce Light](#36-hybrid-lighting-ray-traced-shadows-short-range-rtao--approximate-bounce-light)
    - [3.7 Edge-Stopping Cross-Bilateral Spatial Denoiser](#37-edge-stopping-cross-bilateral-spatial-denoiser)
-4. [Engineering Post-Mortem: Bugs Encountered & How They Were Solved](#4-engineering-post-mortem-bugs-encountered--how-they-were-solved)
+4. [Engineering Post-Mortem: Visual & Systems Debugging Progression](#4-engineering-post-mortem-visual--systems-debugging-progression)
 5. [Build, CLI Flags & Interactive Viewport Controls](#5-build-cli-flags--interactive-viewport-controls)
-6. [Benchmark Reference](#6-benchmark-reference)
+6. [Hardware Telemetry & Benchmark Reference](#6-hardware-telemetry--benchmark-reference)
 
 ---
 
 ## 1. Project Overview & Key Features
 
-`sponza-rt` is a from-scratch real-time ray tracer and hybrid path tracer written in **Rust** and **WGSL**. Rather than relying on vendor-locked hardware ray-tracing APIs (`VK_KHR_ray_tracing_pipeline` or `DXR`), this engine implements the entire acceleration structure builder and ray-traversal kernel in portable compute shaders. It runs natively on **DirectX 12** and **Vulkan** across NVIDIA, AMD, and Intel GPUs.
+`sponza-rt` is a self-contained real-time GPU ray tracer written in **Rust** and **WGSL**. Rather than relying on vendor-specific hardware ray-tracing extensions (`DXR` or `VK_KHR_ray_tracing_pipeline`), it implements the acceleration structure compiler and BVH ray-traversal kernel in portable compute shaders (`@compute @workgroup_size(8, 8, 1)`), executing natively on **DirectX 12** and **Vulkan**.
 
 ### Core Capabilities
-* **Pre-Flight Toolchain & Hardware Scanner**: Inspects host CPU logical parallelism, verifies `cargo`/`rustc` toolchains, enumerates all physical DirectX 12 and Vulkan adapters, and scores them by device type (`DiscreteGpu`, `IntegratedGpu`, `Cpu`), VRAM storage limits, and OS affinity.
-* **Zero-Config Asset & Texture Auto-Installer**: Automatically fetches the Khronos `Sponza.gltf`, the `9.09 MB` binary vertex buffer (`Sponza.bin`), and all **24 PBR base-color textures** in parallel across 8 worker threads. Includes a self-healing procedural Sponza Atrium synthesizer if booted on an offline/air-gapped machine.
-* **Fast 12-Bin SAH BVH Compiler**: Compiles **262,266 triangles** into a **163,553-node** pointerless Bounding Volume Hierarchy in **~212 ms** on CPU before uploading to GPU Shader Storage Buffer Objects (SSBOs).
-* **Custom Bilinear `Texture2DArray` Sampler & Alpha-Cutout BVH Traversal**: Decodes and resizes all Sponza textures into a `512x512` `Rgba8UnormSrgb` GPU texture array. Evaluates `alphaMode: MASK` inside both primary and shadow BVH traversal loops so individual plant leaves, flowers, thorns, and hanging chains cast exact cutout shadows.
-* **Real-Time Low-SPP Denoising Pipeline**: Combines Interleaved Gradient Noise (IGN), TAA-style neighborhood-clamped temporal accumulation, ACES filmic tone mapping, and a $3 \times 3$ depth/luminance edge-stopping cross-bilateral filter for artifact-free 6-DOF movement.
+* **Host Environment Banner & Hardware Adapter Scanner (`print_startup_banner`)**: Reports compile-time package metadata, logical CPU parallelism, and pinned asset revision, then enumerates and scores all physical DirectX 12 and Vulkan GPU adapters by device type (`DiscreteGpu`, `IntegratedGpu`, `Cpu`), VRAM storage binding limits, and OS affinity.
+* **Atomic Sponza Asset & Parallel Texture Auto-Installer (`download_file_atomic`)**: Streams `Sponza.gltf`, the `9.09 MB` binary geometry buffer (`Sponza.bin`), and all **24 base-color textures (`.jpg` / `.png`)** from a pinned Khronos `glTF-Sample-Assets` commit (`723ffc6`) across 8 worker threads. All HTTP reads are size-capped (`take(MAX_ASSET_BYTES + 1)`), verified against `Content-Length` and glTF buffer declarations, written to isolated `.part` temporary files with `sync_all()`, and atomically renamed so interrupted downloads never corrupt the cache.
+* **Depth-Bounded 12-Bin SAH BVH Compiler (`BvhBuilder`)**: Compiles **262,266 triangles** into a **163,553-node** pointerless Bounding Volume Hierarchy in **`212.30 ms`** on the CPU. Enforces `MAX_BVH_DEPTH = 31` and asserts `max_depth <= 32` so the 32-entry GPU traversal stack is mathematically guaranteed never to overflow or drop a subtree.
+* **Hardware sRGB `Texture2DArray` & Alpha-Cutout BVH Traversal (`passes_alpha_cutout`)**: Decodes and resizes all Sponza base-color textures in parallel across CPU cores into a 25-layer `512x512` `Rgba8UnormSrgb` GPU texture array. Evaluates `alphaMode: MASK` inside both closest-hit (`trace_bvh`) and shadow-occlusion (`trace_shadow`) BVH loops so planter leaves, flowers, thorns, and hanging chains cast exact cutout shadows.
+* **Hybrid Ray-Traced Lighting & Bilateral Denoising**: Combines ray-traced direct sun shadows, Blinn-Phong specular modulated by glTF scalar roughness/metallic factors, short-range Ray-Traced Ambient Occlusion (RTAO) stratified with Interleaved Gradient Noise (IGN), approximate single-bounce albedo bleed, neighborhood-clamped temporal accumulation, and a $3 \times 3$ depth/luminance edge-stopping cross-bilateral filter.
 
 ---
 
@@ -40,39 +40,39 @@
 
 ```text
 +-----------------------------------------------------------------------------+
-| [PHASE 1] Pre-Flight System, Cargo & Hardware Requirements Scan             |
-|   -> Detects OS/Arch, logical CPU cores, cargo/rustc versions, CLI flags    |
+| [PHASE 1] Host Environment & CLI Configuration Banner                       |
+|   -> Reports package version, OS/Arch, logical CPU cores, CLI flags         |
 +-----------------------------------------------------------------------------+
                                       |
                                       v
 +-----------------------------------------------------------------------------+
-| [PHASE 2] Sponza glTF & Parallel PBR Texture Provisioner                    |
-|   -> Streams Sponza.gltf + Sponza.bin from Khronos glTF-Sample-Assets       |
-|   -> Spawns 8 HTTP worker threads to fetch 24 PBR textures (.jpg / .png)    |
+| [PHASE 2] Atomic Sponza glTF & Parallel Base-Color Texture Provisioner      |
+|   -> Pinned to KhronosGroup/glTF-Sample-Assets @ 723ffc6                    |
+|   -> Bounded HTTP reads + Content-Length check + .part atomic file rename   |
 |   -> Parallel CPU image decoding into 512x512 RGBA8 sRGB Texture2DArray     |
 |   -> Flattens glTF scene-graph hierarchy with 4x4 world & normal matrices   |
 +-----------------------------------------------------------------------------+
                                       |
                                       v
 +-----------------------------------------------------------------------------+
-| [PHASE 3] 12-Bin Surface Area Heuristic (SAH) BVH Compiler                  |
+| [PHASE 3] Depth-Bounded 12-Bin Surface Area Heuristic (SAH) BVH Compiler    |
 |   -> Evaluates 11 split planes across X, Y, Z axes per internal node        |
-|   -> Flattens tree into pointerless Depth-First Search (DFS) array layout   |
-|   -> Reorders triangle buffer in-place for contiguous leaf cache locality   |
+|   -> Compiles 262,266 triangles into 163,553 DFS nodes in ~212.30 ms        |
+|   -> Enforces and asserts max_depth <= 32 to match GPU traversal stack      |
 +-----------------------------------------------------------------------------+
                                       |
                                       v
 +-----------------------------------------------------------------------------+
 | [PHASE 4] DX12 / Vulkan Adapter Scoring & Compute/Render Pipeline Init      |
 |   -> Scores all physical GPUs; locks onto Discrete GPU (DX12 or Vulkan)     |
-|   -> Allocates SSBOs (Triangles, BVH Nodes, HDR Accumulation Buffer)        |
-|   -> Uploads 25-layer Rgba8UnormSrgb Texture2DArray to VRAM                 |
+|   -> Allocates SSBOs (Triangles: 32.0 MB, BVH: 5.23 MB, Accum: 14.7 MB)     |
+|   -> Uploads 25-layer Rgba8UnormSrgb Texture2DArray (25.0 MB) to VRAM       |
 +-----------------------------------------------------------------------------+
                                       |
                                       v
 +-----------------------------------------------------------------------------+
 | [PHASE 5] Real-Time 6-DOF Render Loop (Compute Pass + Bilateral Blit Pass)  |
-|   -> Pass 1 (@compute cs_main): 8x8 workgroups trace primary, shadow & GI   |
+|   -> Pass 1 (@compute cs_main): Primary ray + shadow ray + RTAO/bleed ray   |
 |   -> Pass 2 (@fragment fs_main): Cross-bilateral spatial denoiser & blit    |
 +-----------------------------------------------------------------------------+
 ```
@@ -83,12 +83,12 @@
 
 ### 3.1 GPU Memory Alignment & Cache-Line Packing (`#[repr(C)]`)
 
-Modern GPU backends (DirectX 12 DXIL, Vulkan SPIR-V, and WGSL) enforce strict `std140` / `std430` memory alignment rules. A `vec3<f32>` in WGSL has a **16-byte alignment** despite occupying 12 bytes, which easily causes silent stride mismatches between Rust structs and GPU buffers if unpadded.
+Modern GPU backends (DirectX 12 DXIL, Vulkan SPIR-V, and WGSL) enforce strict `std140` / `std430` memory alignment rules. A `vec3<f32>` in WGSL has a **16-byte alignment** despite occupying 12 bytes, which causes stride mismatches if unpadded.
 
 To guarantee zero padding ambiguity and optimal L1/L2 GPU cache-line utilization:
 
-1. **`GpuTriangle` (128 bytes — exactly two 64-byte GPU cache lines):**
-   Instead of leaving the 4th float (`.w`) of every `vec4<f32>` as dead padding, we pack the 6 vertex UV coordinates (`uv0.xy`, `uv1.xy`, `uv2.xy`) into the `.w` components of `v0`, `e1`, `e2`, `n0`, `n1`, and `n2`:
+1. **`GpuTriangle` (128 bytes — two 64-byte GPU cache lines):**
+   Instead of leaving the 4th float (`.w`) of each `vec4<f32>` unused, the 6 vertex UV coordinates (`uv0.xy`, `uv1.xy`, `uv2.xy`) are packed directly into the `.w` channels of `v0`, `e1`, `e2`, `n0`, `n1`, and `n2`:
    ```rust
    #[repr(C)]
    #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -99,13 +99,13 @@ To guarantee zero padding ambiguity and optimal L1/L2 GPU cache-line utilization
        pub n0: [f32; 4],           // xyz: vertex normal 0,   w: uv1.y
        pub n1: [f32; 4],           // xyz: vertex normal 1,   w: uv2.x
        pub n2: [f32; 4],           // xyz: vertex normal 2,   w: uv2.y
-       pub albedo_rough: [f32; 4], // xyz: base color factor, w: roughness
-       pub emissive_mat: [f32; 4], // x: tex_layer, y: alpha_cutoff, z: metallic, w: pad
+       pub albedo_rough: [f32; 4], // xyz: base_color_factor, w: roughness_factor
+       pub emissive_mat: [f32; 4], // x: tex_layer_idx, y: alpha_cutoff, z: metallic_factor, w: pad
    }
    ```
-   Precomputing edges $\mathbf{e}_1 = \mathbf{v}_1 - \mathbf{v}_0$ and $\mathbf{e}_2 = \mathbf{v}_2 - \mathbf{v}_0$ on the CPU saves two vector subtractions per ray-triangle test on the GPU.
+   Precomputing triangle edges $\mathbf{e}_1 = \mathbf{v}_1 - \mathbf{v}_0$ and $\mathbf{e}_2 = \mathbf{v}_2 - \mathbf{v}_0$ on the CPU saves two vector subtractions on every ray-triangle intersection test.
 
-2. **`GpuBvhNode` (32 bytes — exactly two nodes per 64-byte GPU cache line):**
+2. **`GpuBvhNode` (32 bytes — two nodes per 64-byte GPU cache line):**
    ```rust
    #[repr(C)]
    #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -119,132 +119,93 @@ To guarantee zero padding ambiguity and optimal L1/L2 GPU cache-line utilization
 
 ---
 
-### 3.2 12-Bin Surface Area Heuristic (SAH) BVH Compiler
+### 3.2 Depth-Bounded 12-Bin Surface Area Heuristic (SAH) BVH Compiler
 
-A naive midpoint-split BVH performs poorly on architectural scenes like Sponza because large floor/wall triangles overlap with dense high-polygon meshes (lion reliefs, foliage, chains).
+We minimize expected ray traversal cost using the **Surface Area Heuristic (SAH)**. By geometric probability, the conditional probability of a random ray intersecting a convex child volume $B_i$ given that it intersects its parent volume $B_P$ is the ratio of their surface areas:
 
-We minimize expected ray traversal cost using the **Surface Area Heuristic (SAH)**. According to geometric probability, the conditional probability of a random ray intersecting a convex child volume $B_i$ given that it intersects its parent volume $B_P$ is proportional to the ratio of their surface areas:
+$$P(\text{hit } B_i \mid \text{hit } B_P) = \frac{SA(B_i)}{SA(B_P)}, \qquad SA(B) = 2(d_x d_y + d_y d_z + d_z d_x)$$
 
-$$P(\text{hit } B_i \mid \text{hit } B_P) = \frac{SA(B_i)}{SA(B_P)}$$
+For any candidate split partitioning parent node $B_P$ into Left ($L$) and Right ($R$) child subsets containing $N_L$ and $N_R$ triangles, the SAH cost model (with traversal cost $C_{\text{trav}} = 0.5$ and triangle intersection cost $C_{\text{isect}} = 1.0$) is:
 
-Where the surface area of an axis-aligned bounding box with extent $\mathbf{d} = \mathbf{b}_{\max} - \mathbf{b}_{\min}$ is:
+$$C_{\text{SAH}} = 0.5 + \frac{SA(B_L)}{SA(B_P)} N_L + \frac{SA(B_R)}{SA(B_P)} N_R$$
 
-$$SA(B) = 2(d_x d_y + d_y d_z + d_z d_x)$$
-
-For any candidate partitioning of a parent node $B_P$ into Left ($L$) and Right ($R$) child subsets containing $N_L$ and $N_R$ triangles, the SAH cost is:
-
-$$C_{\text{SAH}} = C_{\text{trav}} + \frac{SA(B_L)}{SA(B_P)} N_L C_{\text{isect}} + \frac{SA(B_R)}{SA(B_P)} N_R C_{\text{isect}}$$
-
-Rather than sorting primitives $O(N \log^2 N)$ at every level, `BvhBuilder::build_recursive` uses **12-Bin Binned SAH** ($O(N)$ per level):
-1. Along each axis $a \in \{x, y, z\}$, the centroid bounding interval $[c_{\min}, c_{\max}]$ is divided into $B = 12$ uniform bins.
-2. Each triangle is mapped to bin $b = \min\left(\lfloor B \cdot \frac{c_a - c_{\min}}{c_{\max} - c_{\min}} \rfloor, B - 1\right)$, accumulating bin AABBs and counts in a single linear pass.
-3. A forward prefix sweep and backward suffix sweep evaluate all $B - 1 = 11$ split planes in $O(B)$ time.
-4. Primitives are partitioned in-place using an $O(N)$ Hoare two-pointer swap around the lowest-cost plane.
+`BvhBuilder::build_recursive` evaluates **12-Bin Binned SAH** ($O(N)$ per tree level):
+1. Along each axis $a \in \{x, y, z\}$, the centroid interval $[c_{\min}, c_{\max}]$ is divided into $B = 12$ uniform bins.
+2. Each triangle is mapped to bin $b = \min\left(\lfloor B \cdot \frac{c_a - c_{\min}}{c_{\max} - c_{\min}} \rfloor, B - 1\right)$, accumulating bin AABBs and counts in a single pass.
+3. Prefix and suffix sweeps evaluate all $B - 1 = 11$ split planes in $O(B)$ time, and primitives are partitioned in-place via a two-pointer swap whose predicate (`centroid < best_split_pos`) matches the bin boundaries.
+4. **Hard Stack-Depth Invariant**: Because the WGSL traversal kernel uses a fixed 32-entry register/local stack (`var stack: array<u32, 32>`), `build_recursive` tracks `depth` and forces leaf creation if `depth >= MAX_BVH_DEPTH` (`31`), followed by a host-side `assert!(max_depth <= 32)`.
 
 ---
 
 ### 3.3 Pointerless DFS BVH Layout & Ordered Short-Stack Traversal
 
-Notice that `GpuBvhNode` only stores **one** index (`left_or_first`) even though an internal node has **two** children.
-
 Because `BvhBuilder::build_recursive` serializes nodes in **Pre-Order Depth-First Search (DFS)** order:
-* If node `node_idx` is an internal node (`tri_count == 0`), its **left child is guaranteed to reside at `node_idx + 1`**.
-* We only need to store the **right child index** in `left_or_first`.
+* For any internal node at `node_idx` (`tri_count == 0`), its **left child is guaranteed to reside at `node_idx + 1`**.
+* Only the **right child index** needs to be stored in `left_or_first`.
 
-During GPU ray traversal (`trace_bvh`), each thread maintains a tiny register/local-memory stack (`var stack: array<u32, 32>`) and tests both children simultaneously:
-1. Compute ray-slab entry distances $t_L$ and $t_R$ for both children against the current closest hit $t_{\max}$.
-2. If both children are hit, **traverse the nearer child immediately** (`node_idx = near_idx`) and push the farther child onto the stack (`stack[stack_ptr] = far_idx`).
-3. Visiting the nearer child first tightens `result.t` early, allowing subsequent `intersect_aabb` tests to cull distant branches before ever visiting their leaves.
+During GPU ray traversal (`trace_bvh`), each thread tests both children simultaneously:
+1. Compute ray-slab entry distances `dist_l` and `dist_r` for both children against the current closest hit `result.t`.
+2. If both children are intersected, **traverse the nearer child immediately** (`node_idx = near_idx`) and push the farther child onto the stack.
+3. Visiting the nearer child first shrinks `result.t` early, allowing subsequent `intersect_aabb` slab tests to cull distant subtrees completely.
 
 ---
 
 ### 3.4 Möller–Trumbore Ray-Triangle Intersection
 
-For a ray $\mathbf{r}(t) = \mathbf{o} + t\mathbf{d}$ and triangle vertices $(\mathbf{v}_0, \mathbf{v}_1, \mathbf{v}_2)$, any point inside the triangle can be expressed in barycentric coordinates $(u, v)$ where $u \ge 0, v \ge 0, u + v \le 1$:
+For ray $\mathbf{r}(t) = \mathbf{o} + t\mathbf{d}$ and triangle edges $\mathbf{e}_1 = \mathbf{v}_1 - \mathbf{v}_0$, $\mathbf{e}_2 = \mathbf{v}_2 - \mathbf{v}_0$, solving for distance $t$ and barycentric coordinates $(u, v)$ via Cramer's Rule yields:
 
-$$\mathbf{o} + t\mathbf{d} = (1 - u - v)\mathbf{v}_0 + u\mathbf{v}_1 + v\mathbf{v}_2$$
+$$\begin{bmatrix} t \\ u \\ v \end{bmatrix} = \frac{1}{\mathbf{e}_1 \cdot (\mathbf{d} \times \mathbf{e}_2)} \begin{bmatrix} \mathbf{e}_2 \cdot ((\mathbf{o} - \mathbf{v}_0) \times \mathbf{e}_1) \\ (\mathbf{o} - \mathbf{v}_0) \cdot (\mathbf{d} \times \mathbf{e}_2) \\ \mathbf{d} \cdot ((\mathbf{o} - \mathbf{v}_0) \times \mathbf{e}_1) \end{bmatrix}$$
 
-Rearranging terms using the precomputed edges $\mathbf{e}_1 = \mathbf{v}_1 - \mathbf{v}_0$ and $\mathbf{e}_2 = \mathbf{v}_2 - \mathbf{v}_0$ yields the $3 \times 3$ linear system:
+Once a hit $(t, u, v)$ is confirmed, vertex normals and UV coordinates are interpolated via barycentric weights $w = 1 - u - v$:
 
-$$\begin{bmatrix} -\mathbf{d} & \mathbf{e}_1 & \mathbf{e}_2 \end{bmatrix} \begin{bmatrix} t \\ u \\ v \end{bmatrix} = \mathbf{o} - \mathbf{v}_0$$
-
-Applying **Cramer's Rule** with scalar triple products ($\mathbf{h} = \mathbf{d} \times \mathbf{e}_2$, $\mathbf{s} = \mathbf{o} - \mathbf{v}_0$, $\mathbf{q} = \mathbf{s} \times \mathbf{e}_1$):
-
-$$\begin{bmatrix} t \\ u \\ v \end{bmatrix} = \frac{1}{\mathbf{e}_1 \cdot (\mathbf{d} \times \mathbf{e}_2)} \begin{bmatrix} \mathbf{e}_2 \cdot (\mathbf{s} \times \mathbf{e}_1) \\ \mathbf{s} \cdot (\mathbf{d} \times \mathbf{e}_2) \\ \mathbf{d} \cdot (\mathbf{s} \times \mathbf{e}_1) \end{bmatrix} = \frac{1}{\mathbf{e}_1 \cdot \mathbf{h}} \begin{bmatrix} \mathbf{e}_2 \cdot \mathbf{q} \\ \mathbf{s} \cdot \mathbf{h} \\ \mathbf{d} \cdot \mathbf{q} \end{bmatrix}$$
-
-In `intersect_triangle`, early-exit guards immediately reject rays if $a = \mathbf{e}_1 \cdot \mathbf{h} \approx 0$ (parallel), $u \notin [0, 1]$, or $v < 0 \lor u + v > 1$, avoiding unnecessary vector operations.
+$$\mathbf{n} = \text{normalize}(w\mathbf{n}_0 + u\mathbf{n}_1 + v\mathbf{n}_2), \qquad \mathbf{uv} = w\mathbf{uv}_0 + u\mathbf{uv}_1 + v\mathbf{uv}_2$$
 
 ---
 
-### 3.5 Hardware Texture2DArray & Ray-Traced Alpha-Cutout Masks
+### 3.5 Base-Color `Texture2DArray` & Ray-Traced Alpha-Cutout Masks
 
-In standard rasterization, GPU hardware uses $2 \times 2$ pixel quads to compute screen-space derivatives ($\frac{\partial u}{\partial x}, \frac{\partial v}{\partial y}$) for `textureSample`. Inside a compute shader with divergent secondary rays, implicit screen-space derivatives do not exist, and `textureSampleLevel` can trigger uniformity validation errors in non-uniform BVH loops.
+In compute shaders with divergent secondary rays, screen-space $2 \times 2$ quad derivatives do not exist, and `textureSample` cannot be called inside non-uniform BVH loops.
 
-To solve this cleanly across both DirectX 12 and Vulkan:
-1. All 24 Sponza base-color textures are resized to `512x512` and uploaded as an `Rgba8UnormSrgb` `texture_2d_array<f32>`. Using an `Srgb` texture format instructs the GPU's texture unit to perform **free hardware sRGB-to-linear conversion** on every `textureLoad`.
-2. `sample_material_tex` implements an explicit 4-tap bilinear filter using `textureLoad` with bitwise toroidal wrapping (`& 511`), which is valid inside arbitrary divergent control flow.
-3. For foliage, flowers, thorns, and chains (`alphaMode: MASK`), `passes_alpha_cutout` interpolates $(u, v)$ at the exact intersection point inside `trace_bvh` and `trace_shadow`. If $\alpha < \text{cutoff}$, the intersection is ignored and BVH traversal continues seamlessly through the transparent part of the leaf quad.
+To solve this cleanly across DirectX 12 and Vulkan:
+1. All 24 Sponza base-color textures are decoded in parallel and uploaded as a 25-layer `512x512` `Rgba8UnormSrgb` `texture_2d_array<f32>` (Layer 0 is a solid fallback layer; Layers 1..24 hold the Sponza base-color textures). Using an `Srgb` format instructs the GPU's texture hardware to perform **sRGB-to-linear conversion** automatically on every read.
+2. `sample_material_tex` implements an explicit 4-tap bilinear filter using `textureLoad` with bitwise wrapping (`& 511`), which is valid inside any divergent control flow.
+3. For cutout materials (`alphaMode: MASK` — planter flowers, ivy leaves, thorns, and hanging chains), `passes_alpha_cutout` evaluates the texture alpha at the exact $(u, v)$ hit point inside `trace_bvh` and `trace_shadow`. If $\alpha < \text{cutoff}$, the hit is rejected and the ray continues through the transparent region of the quad.
 
 ---
 
-### 3.6 Lighting, Blue-Noise RTAO & Temporal Neighborhood Clamping
+### 3.6 Hybrid Lighting: Ray-Traced Shadows, Short-Range RTAO & Approximate Bounce Light
 
-Enclosed architectural scenes like Sponza suffer from severe **Monte Carlo fireflies** (bright white salt-and-pepper noise spikes) if shaded with naive unweighted path tracing, because ~85% of the atrium is in shadow while small patches of the floor receive intense direct sunlight.
+Rather than tracing high-variance multi-bounce paths (which cause severe Monte Carlo fireflies at 1 SPP inside Sponza's enclosed courtyard), `cs_main` uses a fast hybrid ray-tracing model casting **up to 3 rays per pixel**:
 
-We eliminate fireflies at 1 SPP via a hybrid lighting formulation:
-* **Next-Event Estimation (Direct Sun Shadow Ray):** Every primary hit tests visibility directly toward the sun directional light (`trace_shadow`), with soft-shadow disk jittering enabled once `frame_idx > 2`.
-* **Interleaved Gradient Noise (IGN) Hemisphere Sampling:** Instead of white-noise PRNGs that clump spatially at 1 SPP, hemisphere directions are stratified using Jorge Jimenez's Interleaved Gradient Noise:
-  $$\text{IGN}(x, y) = \text{fract}\left(52.9829189 \cdot \text{fract}(0.06711056 x + 0.00583715 y)\right)$$
-* **Bounded RTAO + Indirect Color Bleed:** A cosine-weighted secondary ray (`sample_cosine_hemisphere`) queries local occlusion and samples the hit triangle's real texture albedo, clamping indirect bounce energy so a single random ray cannot blow out a pixel.
-* **TAA-Style Neighborhood-Clamped Motion Blending:** When moving (`frame_idx == 0`), instead of discarding 100% of history (which exposes raw 1-SPP noise) or keeping unconstrained history (which causes ghosting), the shader clamps the previous frame's radiance to a local neighborhood interval $[0.55 L_{\text{cur}}, 1.45 L_{\text{cur}} + 0.08]$ and blends 22% clamped history.
+1. **Primary Visibility Ray (`trace_bvh`)**: Finds the closest surface intersection and evaluates base-color texture albedo, scalar `roughnessFactor`, and scalar `metallicFactor`.
+2. **Direct Sun Shadow Ray (`trace_shadow`) + Blinn-Phong Specular**: Casts a shadow ray toward the directional sun (`sun_dir`), with soft-shadow disk jittering enabled once `frame_idx > 2` using a 24-bit uniform float generator (`f32(*seed >> 8u) * (1.0 / 16777216.0)` in $[0, 1)$). Direct lighting combines Lambertian diffuse with a Blinn-Phong specular lobe modulated by the material's scalar roughness and metallic factors.
+3. **Short-Range RTAO + Approximate Single-Bounce Albedo Bleed**: A cosine-weighted hemisphere ray (`max_dist = 8.5m`) stratified with **Interleaved Gradient Noise (IGN)** queries local ambient occlusion (`ao_factor = clamp(ao_hit.t / 4.2, 0.20, 1.0)`). When an occluder is hit within `8.5m`, its textured base-color albedo is sampled (`b_albedo * 0.42`) and combined with analytical hemisphere sky/floor/corridor fill terms.
+4. **TAA-Style Motion Clamping**: On `frame_idx == 0` (during camera movement), previous frame radiance is clamped to $[0.55 L_{\text{cur}}, 1.45 L_{\text{cur}} + 0.08]$ and blended at 22% weight to suppress single-frame shimmering without ghosting.
 
 ---
 
 ### 3.7 Edge-Stopping Cross-Bilateral Spatial Denoiser
 
-During camera motion (`frame_idx < 20`), `cs_main` writes normalized primary ray hit depth $z \in [0.02, 0.99]$ into the alpha channel of `output_tex`. The fullscreen pass (`fs_main`) runs a $3 \times 3$ **Edge-Stopping Cross-Bilateral Filter**:
+When `frame_idx < 20` (during or immediately after camera movement), `cs_main` writes normalized primary hit depth $z \in [0.02, 0.99]$ into the alpha channel of `output_tex`. The fullscreen fragment pass (`fs_main`) runs a $3 \times 3$ **Edge-Stopping Cross-Bilateral Filter**:
 
 $$C_{\text{out}}(\mathbf{p}) = \frac{\sum_{\mathbf{q} \in \mathcal{N}(\mathbf{p})} w_s(\mathbf{p}, \mathbf{q}) \, w_z(\mathbf{p}, \mathbf{q}) \, w_l(\mathbf{p}, \mathbf{q}) \, C(\mathbf{q})}{\sum_{\mathbf{q} \in \mathcal{N}(\mathbf{p})} w_s(\mathbf{p}, \mathbf{q}) \, w_z(\mathbf{p}, \mathbf{q}) \, w_l(\mathbf{p}, \mathbf{q})}$$
 
-Where the depth and luminance edge-stopping weights are:
-
-$$w_z(\mathbf{p}, \mathbf{q}) = \exp\left(-1200 \, \vert{}z(\mathbf{p}) - z(\mathbf{q})\vert{}^2\right), \qquad w_l(\mathbf{p}, \mathbf{q}) = \exp\left(-18 \, \vert{}Y(\mathbf{p}) - Y(\mathbf{q})\vert{}^2\right)$$
-
-Once the camera stops moving and progressive accumulation reaches `SPP >= 20`, `cs_main` sets `alpha = 0.0`, instructing `fs_main` to bypass the spatial filter completely so the converged image retains 100% native pixel sharpness.
+Once progressive accumulation reaches `SPP >= 20`, `cs_main` writes `alpha = 0.0`, bypassing the spatial filter completely so the converged render retains 100% native pixel sharpness.
 
 ---
 
-## 4. Engineering Post-Mortem: Bugs Encountered & How They Were Solved
+## 4. Engineering Post-Mortem: Visual & Systems Debugging Progression
 
-This section documents the three real-world engineering issues encountered during development and their exact fixes:
-
-### Bug 1: `wgpu 22.1.0` Entry-Point API Signature (`E0308`)
-* **Symptom:** Rust compiler threw `error[E0308]: mismatched types: expected &str, found Option<&str>` on `entry_point: Some("cs_main")`.
-* **Root Cause:** `wgpu` changed `ComputePipelineDescriptor::entry_point` and `VertexState::entry_point` from `&'a str` in `wgpu 22.x` to `Option<&'a str>` in `wgpu 23.x`.
-* **Fix:** Passed bare string slices (`entry_point: "cs_main"`, `"vs_main"`, `"fs_main"`) matching the pinned `wgpu = "22.1.0"` crate specification.
-
-### Bug 2: WGSL / `naga` Reserved Keyword Collision (`meta`)
-* **Symptom:** Runtime validation panic inside `Device::create_shader_module`:
-  `Shader 'Sponza RayTracing Shader' parsing error: name 'meta' is a reserved keyword`.
-* **Root Cause:** Even though `meta` is not an active type in WGSL 1.0, the W3C WGSL specification reserves `meta` in its future-reserved keyword table, which `wgpu`'s `naga` front-end strictly enforces.
-* **Fix:** Renamed the uniform struct field from `meta` to `frame_info` across `CameraUniform` in both `src/main.rs` and `src/shader.wgsl`.
-
-### Bug 3: Monochrome White Geometry, Hashed glTF Texture URIs & 1-SPP Motion Fireflies
-* **Symptom 1 (Grayscale Scene):** Initial render displayed a monochrome gray-white Sponza Atrium with heavy white-dot salt-and-pepper noise when moving.
-* **Symptom 2 (Mismatched Heuristic Colors):** Attempting to classify Sponza materials by material name and mesh bounding-box centers colored the curtains limestone beige and the hanging cauldrons plant green.
-* **Root Cause:**
-  1. In Khronos `Sponza.gltf`, every material sets `baseColorFactor: [1.0, 1.0, 1.0, 1.0]` and stores all color data in external `.jpg`/`.png` textures.
-  2. Furthermore, the Khronos glTF exporter names all textures with 64-bit numeric hashes (e.g., `5784830445105232510.jpg`) and merges opposing curtain bays into single meshes centered at `(0, 0, 0)`.
-  3. Unweighted Monte Carlo path tracing in a deep occluded courtyard caused ~10% of secondary rays hitting sunlit floor tiles to spike 40x brighter than neighboring rays hitting shadowed walls.
-* **Fix:** Built a multi-threaded HTTP downloader and parallel `image` decoder in `src/main.rs` that fetches all 24 authentic Sponza textures, uploads them into a hardware sRGB `texture_2d_array<f32>`, evaluates alpha-cutout masks inside the BVH traversal, and pairs Blue-Noise RTAO with a depth-aware cross-bilateral denoiser.
+| Iteration | Issue / Symptom Encountered | Root Cause Analysis | Engineering Fix Implemented |
+| :--- | :--- | :--- | :--- |
+| **Build 1** | `error[E0308]` on `entry_point: Some("cs_main")` & WGSL `meta` keyword panic | `wgpu 22.1.0` expects `&str` instead of `Option<&str>`; `meta` is a future-reserved keyword in W3C WGSL (`naga`). | Unwrapped `entry_point` string literals and renamed `meta` $\rightarrow$ `frame_info` in `CameraUniform`. |
+| **Build 2** | Monochrome gray scene (`38.6 FPS`) with white salt-and-pepper fireflies during WASD/mouse movement | Khronos `Sponza.gltf` sets `baseColorFactor = [1,1,1,1]` on all materials and stores colors in external textures. Unweighted 1-SPP bounces into sunlit floor patches spiked 40x brighter than shadowed walls. | Added IGN-stratified short-range RTAO, bounded single-bounce albedo bleed, TAA-style motion history clamping, and a depth-aware cross-bilateral denoiser. |
+| **Build 3** | Heuristic material classifier colored curtains beige and cauldrons/lion head green (`55.3 FPS`) | Khronos `Sponza.gltf` names texture files with 64-bit numeric hashes (e.g., `5784830445105232510.jpg`) and merges opposing curtain bays into single meshes centered at `(0, 0, 0)`. | Replaced heuristics with a parallel 8-thread HTTP texture provisioner, parallel `image` decoding, a 25-layer `Rgba8UnormSrgb` GPU `Texture2DArray`, and ray-traced alpha-cutout masks (`43.3 FPS`). |
+| **Build 4** | Audit hardening: BVH stack depth invariant, atomic download cache, and 24-bit PRNG precision | Unbounded tree depth could overflow a 32-entry GPU stack; interrupted downloads could leave truncated files cached; `f32(seed) / 4294967295.0` could round to `1.0`. | Enforced `MAX_BVH_DEPTH = 31` + `assert!(max_depth <= 32)`, pinned commit SHA `723ffc6`, added `.take()` + `Content-Length` + `.part` atomic rename, and switched `rand_f32` to `f32(*seed >> 8u) * (1.0 / 16777216.0)`. |
 
 ---
 
 ## 5. Build, CLI Flags & Interactive Viewport Controls
-
-### Prerequisites
-* **Rust Toolchain**: `cargo` and `rustc` (2021 edition or newer)
-* **GPU**: Any DirectX 12 (Windows) or Vulkan (Windows/Linux) capable GPU
 
 ### Build & Run
 ```powershell
@@ -272,15 +233,15 @@ cargo run --release -- --dx12
 
 ---
 
-## 6. Benchmark Reference
+## 6. Hardware Telemetry & Benchmark Reference
 
-Measured on a Windows `x86_64` system (8 logical cores) at `1280x720` resolution:
+Captured on Windows `x86_64` (8 logical cores) at `1280x720`:
 
-| Metric | Value |
+| Telemetry Metric | Measured Value |
 | :--- | :--- |
-| **Primary GPU** | NVIDIA GeForce RTX 3050 Laptop GPU (`DiscreteGpu`, DX12 & Vulkan) |
-| **Scene Complexity** | 262,266 Textured Triangles (Khronos Sponza glTF) |
-| **SAH BVH Nodes** | 163,553 Nodes (`32 bytes/node`, `5.23 MB` total BVH footprint) |
-| **CPU SAH BVH Build Time** | `212.30 ms` (12-bin SAH across X/Y/Z axes) |
-| **PBR Texture Array** | 25 Layers @ `512x512` `Rgba8UnormSrgb` (`25.0 MB` VRAM) |
-| **Real-Time Framerate** | **~55.3 FPS** continuous ray tracing + bilateral denoising |
+| **Locked GPU Adapter** | `NVIDIA GeForce RTX 3050 Laptop GPU` (`DiscreteGpu`, Vendor `0x10DE`) |
+| **Graphics Backend** | `DirectX 12` (Score: `1300`) / `Vulkan` (Score: `1250`) |
+| **Scene Geometry** | `262,266` Textured Triangles (`Sponza.gltf` + `9.09 MB` `Sponza.bin` @ `723ffc6`) |
+| **SAH BVH Acceleration Tree** | `163,553` Nodes (`5.23 MB` SSBO, built in `212.30 ms` via 12-bin SAH, depth $\le 32$) |
+| **GPU Texture2DArray** | `25` Layers $\times$ `512x512` `Rgba8UnormSrgb` (`25.0 MB` VRAM) |
+| **Real-Time Ray-Traced Framerate** | **`43.3 FPS`** (Base-Color Texture Array + Alpha-Cutout BVH + Shadows + RTAO) |
