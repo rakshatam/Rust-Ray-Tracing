@@ -1,0 +1,9 @@
+/target/
+**/*.rs.bk
+*.pdb
+/assets/
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+!SponzaRT.png
